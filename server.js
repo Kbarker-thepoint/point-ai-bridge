@@ -1,10 +1,26 @@
 // Point AI — 3-way call bridge server.
+//
+// Joins a CRM call (GoHighLevel, etc.) as a silent third leg, streams the mixed
+// phone audio to Deepgram, and pushes diarized transcript lines back into Point
+// AI via the pushTranscriptLine endpoint.
+//
+// No Twilio REST credentials are needed here — we only answer Twilio voice
+// webhooks and accept a Twilio Media Stream over WebSocket. Configure the
+// webhook in the Twilio number's voice settings (see README.md).
+//
+// Env: see .env.example
 import express from "express";
 import { WebSocketServer, WebSocket } from "ws";
 
 const app = express();
 app.use(express.urlencoded({ extended: true }));
 app.use(express.json());
+
+// Log every request so Twilio webhook hits show up in Railway logs.
+app.use((req, _res, next) => {
+  console.log(`${new Date().toISOString()} ${req.method} ${req.url} from ${req.headers["x-twilio-signature"] ? "Twilio" : req.ip}`);
+  next();
+});
 
 const PORT = process.env.PORT || 8080;
 const BRIDGE_API_KEY = process.env.BRIDGE_API_KEY;
@@ -18,6 +34,7 @@ if (!BRIDGE_API_KEY || !POINT_START_URL || !POINT_PUSH_URL) {
 
 const publicHost = (req) => process.env.PUBLIC_URL || req.headers.host;
 
+// 1) Twilio voice webhook — prompt for the 6-digit PIN.
 app.post("/twiml", (req, res) => {
   res.type("xml").send(`<?xml version="1.0" encoding="UTF-8"?>
 <Response>
@@ -28,6 +45,7 @@ app.post("/twiml", (req, res) => {
 </Response>`);
 });
 
+// 2) PIN collected — connect the media stream, carry the PIN through.
 app.post("/gather", (req, res) => {
   const pin = req.body?.Digits || "";
   const host = publicHost(req);
@@ -41,6 +59,7 @@ app.post("/gather", (req, res) => {
 </Response>`);
 });
 
+// Health check (handy for Render/Railway).
 app.get("/health", (req, res) => res.json({ ok: true }));
 
 const server = app.listen(PORT, () =>
@@ -53,32 +72,53 @@ wss.on("connection", (ws, req) => {
   ws.close();
 });
 
+// Twilio Media Stream → Deepgram → pushTranscriptLine.
 async function handleStream(ws) {
-  let state = null;
+  let state = null; // { dg, sessionId, ownerId, seq }
+
   ws.on("message", async (msg) => {
     let event;
-    try { event = JSON.parse(msg.toString()); } catch { return; }
+    try {
+      event = JSON.parse(msg.toString());
+    } catch {
+      return;
+    }
+
+    // Start: claim the agent's waiting session, open Deepgram (mulaw/8kHz).
     if (event.event === "start") {
       const pin = event.start?.customParameters?.pin || "";
       try {
         const r = await fetch(POINT_START_URL, {
           method: "POST",
-          headers: { "Content-Type": "application/json", "x-bridge-key": BRIDGE_API_KEY },
+          headers: {
+            "Content-Type": "application/json",
+            "x-bridge-key": BRIDGE_API_KEY,
+          },
           body: JSON.stringify({ pin }),
         });
         const s = await r.json();
         if (!r.ok || !s.sessionId || !s.deepgramUrl || !s.deepgramToken) {
           console.error("Session claim failed:", s);
-          try { ws.close(); } catch {}
+          try {
+            ws.close();
+          } catch {}
           return;
         }
         const dg = new WebSocket(s.deepgramUrl, ["token", s.deepgramToken]);
         state = { dg, sessionId: s.sessionId, ownerId: s.ownerId, seq: 0 };
-        dg.on("open", () => console.log(`Deepgram open — session ${state.sessionId}`));
+
+        dg.on("open", () =>
+          console.log(`Deepgram open — session ${state.sessionId}`)
+        );
         dg.on("error", (e) => console.error("Deepgram error:", e.message));
+
         dg.on("message", async (dgMsg) => {
           let rj;
-          try { rj = JSON.parse(dgMsg.toString()); } catch { return; }
+          try {
+            rj = JSON.parse(dgMsg.toString());
+          } catch {
+            return;
+          }
           if (rj.type !== "Results" || !rj.is_final) return;
           const alt = rj.channel?.alternatives?.[0];
           const text = alt?.transcript?.trim();
@@ -89,28 +129,54 @@ async function handleStream(ws) {
           try {
             await fetch(POINT_PUSH_URL, {
               method: "POST",
-              headers: { "Content-Type": "application/json", "x-bridge-key": BRIDGE_API_KEY },
-              body: JSON.stringify({ sessionId: state.sessionId, ownerId: state.ownerId, speaker, text, seq: state.seq }),
+              headers: {
+                "Content-Type": "application/json",
+                "x-bridge-key": BRIDGE_API_KEY,
+              },
+              body: JSON.stringify({
+                sessionId: state.sessionId,
+                ownerId: state.ownerId,
+                speaker,
+                text,
+                seq: state.seq,
+              }),
             });
-          } catch (e) { console.error("Push failed:", e.message); }
+          } catch (e) {
+            console.error("Push failed:", e.message);
+          }
         });
       } catch (e) {
         console.error("Claim error:", e.message);
-        try { ws.close(); } catch {}
+        try {
+          ws.close();
+        } catch {}
       }
       return;
     }
+
+    // Media: forward Twilio's mulaw audio bytes straight to Deepgram.
     if (event.event === "media") {
       if (state?.dg?.readyState === WebSocket.OPEN) {
         state.dg.send(Buffer.from(event.media.payload, "base64"));
       }
       return;
     }
+
+    // Stop: tear down.
     if (event.event === "stop") {
-      if (state?.dg) { try { state.dg.close(); } catch {} }
+      if (state?.dg) {
+        try {
+          state.dg.close();
+        } catch {}
+      }
     }
   });
+
   ws.on("close", () => {
-    if (state?.dg) { try { state.dg.close(); } catch {} }
+    if (state?.dg) {
+      try {
+        state.dg.close();
+      } catch {}
+    }
   });
 }
